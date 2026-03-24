@@ -54,6 +54,38 @@ TOOLS = [{
 input_counter = 0 
 agent_counter = 0
 
+# 全局统计字典
+token_stats = {}
+
+def update_token_stats(response):
+    """更新 token 使用统计"""
+    model = response.model
+    usage = response.usage
+
+    # 确保该模型已有统计条目
+    if model not in token_stats:
+        token_stats[model] = {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+        }
+
+    # 累加各个字段，注意 None 值转为 0
+    token_stats[model]["input_tokens"] += usage.input_tokens or 0
+    token_stats[model]["output_tokens"] += usage.output_tokens or 0
+    token_stats[model]["cache_creation_input_tokens"] += usage.cache_creation_input_tokens or 0
+    token_stats[model]["cache_read_input_tokens"] += usage.cache_read_input_tokens or 0
+
+def print_token_stats():
+    print("=== Token Usage Statistics ===")
+    for model, stats in token_stats.items():
+        print(f"Model: {model}")
+        print(f"  Input tokens: {stats['input_tokens']}")
+        print(f"  Output tokens: {stats['output_tokens']}")
+        print(f"  Cache creation input tokens: {stats['cache_creation_input_tokens']}")
+        print(f"  Cache read input tokens: {stats['cache_read_input_tokens']}")
+
 def serialize_history(history):
     serialized = []
     for item in history:
@@ -91,18 +123,19 @@ def agent_loop(messages: list):
     global agent_counter
     while True:
         agent_counter += 1
-        print(f"=== input #{input_counter}::agent #{agent_counter} === calling LLM ......")
+        print("------------------------------------------------------------------------------------------------------------------------")
+        print(f"=== user input (loop#{input_counter})::agent action (loop#{agent_counter}) === calling LLM ......")
         response = anthropic_client.messages.create(
             model=MODEL, system=SYSTEM, messages=messages,
             tools=TOOLS, max_tokens=8000,
         )
-        
-        print(f"=== input #{input_counter}::agent #{agent_counter} === response: ")
+        update_token_stats(response)
+
+        print(f"=== user input (loop#{input_counter})::agent action (loop#{agent_counter}) === response: ")
         if hasattr(response, "model_dump"):
             print(json.dumps(response.model_dump(), indent=2, ensure_ascii=False))
         else:
             pprint(response, indent=2, width=120)
-        print("-----------------------------------------------------------------------")
 
         # Append assistant turn
         messages.append({"role": "assistant", "content": response.content})
@@ -118,13 +151,12 @@ def agent_loop(messages: list):
                 #print(output[:200])
                 results.append({"type": "tool_result", "tool_use_id": block.id,
                                 "content": output})
-                print(f"=== input #{input_counter}::agent #{agent_counter} === user_run_tool result: ")
-                pprint(results, indent=2, width=120)
-                #results_serialized = serialize_history(results)
-                #print(json.dumps(results_serialized, indent=2, ensure_ascii=False))
-                print("-----------------------------------------------------------------------")
+                print("------------------------------------------------------------------------------------------------------------------------")
+                print(f"=== user input (loop#{input_counter})::agent action (loop#{agent_counter}) === user_run_tool result: ")
+                results_serialized = serialize_history(results)
+                print(json.dumps(results_serialized, indent=2, ensure_ascii=False))
 
-        messages.append({"role": "user_run_tool", "content": results})
+        messages.append({"role": "user", "content": results})
 
 if __name__ == "__main__":
     history = []
@@ -137,19 +169,26 @@ if __name__ == "__main__":
             break
         input_counter += 1
         history.append({"role": "user", "content": query})
-        print(f"<<<<<< input #{input_counter} >>>>>> history_input: ")
-        #pprint(history, indent=2, width=12000)
+
+        print("------------------------------------------------------------------------------------------------------------------------")
+        print("------------------------------------------------------------------------------------------------------------------------")
+        print(f"<<<<<< user input (loop#{input_counter}) >>>>>>")
+        pprint(f"{query}")
+        print(f"<<<<<< hist input (loop#{input_counter}) >>>>>>")
         history_serialized = serialize_history(history)
         print(json.dumps(history_serialized, indent=2, ensure_ascii=False))
-        print("-----------------------------------------------------------------------")
 
         agent_counter = 0
         agent_loop(history)
 
-        print(f"<<<<<< input #{input_counter} >>>>>> history_output: ")
+        print("------------------------------------------------------------------------------------------------------------------------")
+        print(f"<<<<<< hist output (loop#{input_counter}) >>>>>>")
         history_serialized = serialize_history(history)
         print(json.dumps(history_serialized, indent=2, ensure_ascii=False))
-        print("-----------------------------------------------------------------------")
+        print("------------------------------------------------------------------------------------------------------------------------")
+        print_token_stats()
+        print("------------------------------------------------------------------------------------------------------------------------")
+        print("------------------------------------------------------------------------------------------------------------------------")
         #response_content = history[-1]["content"]
         #if isinstance(response_content, list):
         #    for block in response_content:
