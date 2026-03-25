@@ -26,8 +26,7 @@ policy, hooks, and lifecycle controls on top.
 
 import os
 import subprocess
-import json
-from pprint import pprint
+
 from anthropic import Anthropic
 from dotenv import load_dotenv
 
@@ -41,17 +40,12 @@ MODEL = os.environ["MODEL_ID"]
 
 SYSTEM = f"You are a coding agent at {os.getcwd()}. Use bash to solve tasks. Act, don't explain."
 
-TOOLS = [{
-    "name": "bash",
-    "description": "Run a shell command.",
-    "input_schema": {
-        "type": "object",
-        "properties": {"command": {"type": "string"}},
-        "required": ["command"],
-    },
-}]
-
-input_counter = 0 
+##add_private_codes_begin############################################################################
+from pprint import pprint
+import json
+# 统计用户输入loop次数
+input_counter = 0
+# 统计针对每次用户输入agent和LLM交互次数
 agent_counter = 0
 
 # 全局统计字典
@@ -78,7 +72,7 @@ def update_token_stats(response):
     token_stats[model]["cache_read_input_tokens"] += usage.cache_read_input_tokens or 0
 
 def print_token_stats():
-    print("=== Token Usage Statistics ===")
+    print("=== Token Usage Statistics (total from session start) ===")
     for model, stats in token_stats.items():
         print(f"Model: {model}")
         print(f"  Input tokens: {stats['input_tokens']}")
@@ -104,6 +98,17 @@ def serialize_list(list_data):
             item_copy["content"] = new_content
         serialized.append(item_copy)
     return serialized
+##add_private_codes_end############################################################################
+
+TOOLS = [{
+    "name": "bash",
+    "description": "Run a shell command.",
+    "input_schema": {
+        "type": "object",
+        "properties": {"command": {"type": "string"}},
+        "required": ["command"],
+    },
+}]
 
 def run_bash(command: str) -> str:
     dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
