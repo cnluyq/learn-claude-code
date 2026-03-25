@@ -86,9 +86,9 @@ def print_token_stats():
         print(f"  Cache creation input tokens: {stats['cache_creation_input_tokens']}")
         print(f"  Cache read input tokens: {stats['cache_read_input_tokens']}")
 
-def serialize_history(history):
+def serialize_list(list_data):
     serialized = []
-    for item in history:
+    for item in list_data:
         # 复制一份，避免修改原数据
         item_copy = item.copy()
         # 如果 content 是列表，递归处理其中的对象
@@ -153,7 +153,7 @@ def agent_loop(messages: list):
                                 "content": output})
                 print("------------------------------------------------------------------------------------------------------------------------")
                 print(f"=== user input (loop#{input_counter})::agent action (loop#{agent_counter}) === user_run_tool result: ")
-                results_serialized = serialize_history(results)
+                results_serialized = serialize_list(results)
                 print(json.dumps(results_serialized, indent=2, ensure_ascii=False))
 
         messages.append({"role": "user", "content": results})
@@ -175,7 +175,7 @@ if __name__ == "__main__":
         print(f"<<<<<< user input (loop#{input_counter}) >>>>>>")
         pprint(f"{query}")
         print(f"<<<<<< hist input (loop#{input_counter}) >>>>>>")
-        history_serialized = serialize_history(history)
+        history_serialized = serialize_list(history)
         print(json.dumps(history_serialized, indent=2, ensure_ascii=False))
 
         agent_counter = 0
@@ -183,7 +183,7 @@ if __name__ == "__main__":
 
         print("------------------------------------------------------------------------------------------------------------------------")
         print(f"<<<<<< hist output (loop#{input_counter}) >>>>>>")
-        history_serialized = serialize_history(history)
+        history_serialized = serialize_list(history)
         print(json.dumps(history_serialized, indent=2, ensure_ascii=False))
         print("------------------------------------------------------------------------------------------------------------------------")
         print_token_stats()
