@@ -240,12 +240,26 @@ CHILD_TOOLS = [
 
 # -- Subagent: fresh context, filtered tools, summary-only return --
 def run_subagent(prompt: str) -> str:
+    global input_counter
+    global agent_counter
+    subagent_loop = 0
     sub_messages = [{"role": "user", "content": prompt}]  # fresh context
     for _ in range(30):  # safety limit
+        subagent_loop += 1
+        print("------------------------------------------------------------------------------------------------------------------------")
+        print(f"=== user#{input_counter}::agent#{agent_counter}::subagent#{subagent_loop} === {time.strftime('%Y-%m-%d %H:%M:%S')} calling LLM ......")
         response = client.messages.create(
             model=MODEL, system=SUBAGENT_SYSTEM, messages=sub_messages,
             tools=CHILD_TOOLS, max_tokens=8000,
         )
+        update_token_stats(response)
+
+        print(f"=== user#{input_counter}::agent#{agent_counter}::subagent#{subagent_loop} === {time.strftime('%Y-%m-%d %H:%M:%S')} response: ")
+        if hasattr(response, "model_dump"):
+            print(json.dumps(response.model_dump(), indent=2, ensure_ascii=False))
+        else:
+            pprint(response, indent=2, width=120)
+
         sub_messages.append({"role": "assistant", "content": response.content})
         if response.stop_reason != "tool_use":
             break
@@ -255,7 +269,13 @@ def run_subagent(prompt: str) -> str:
                 handler = TOOL_HANDLERS.get(block.name)
                 output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
                 results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)[:50000]})
+
+        print("------------------------------------------------------------------------------------------------------------------------")
+        print(f"=== user#{input_counter}::agent#{agent_counter}::subagent#{subagent_loop} === {time.strftime('%Y-%m-%d %H:%M:%S')} user_run_tool \"{block.name}\" result: ")
+        results_serialized = serialize_list(results)
+        print(json.dumps(results_serialized, indent=2, ensure_ascii=False))
         sub_messages.append({"role": "user", "content": results})
+
     # Only the final text returns to the parent -- child context is discarded
     return "".join(b.text for b in response.content if hasattr(b, "text")) or "(no summary)"
 
@@ -288,7 +308,7 @@ def agent_loop(messages: list):
     while True:
         agent_counter += 1
         print("------------------------------------------------------------------------------------------------------------------------")
-        print(f"=== user input (loop#{input_counter})::agent action (loop#{agent_counter}) === {time.strftime('%Y-%m-%d %H:%M:%S')} calling LLM ......")
+        print(f"=== user#{input_counter}::agent#{agent_counter} === {time.strftime('%Y-%m-%d %H:%M:%S')} calling LLM ......")
 
         response = client.messages.create(
             model=MODEL, system=SYSTEM, messages=messages,
@@ -296,7 +316,7 @@ def agent_loop(messages: list):
         )
         update_token_stats(response)
 
-        print(f"=== user input (loop#{input_counter})::agent action (loop#{agent_counter}) === {time.strftime('%Y-%m-%d %H:%M:%S')} response: ")
+        print(f"=== user#{input_counter}::agent#{agent_counter} === {time.strftime('%Y-%m-%d %H:%M:%S')} response: ")
         if hasattr(response, "model_dump"):
             print(json.dumps(response.model_dump(), indent=2, ensure_ascii=False))
         else:
@@ -312,16 +332,16 @@ def agent_loop(messages: list):
                     desc = block.input.get("description", "subtask")
                     #print(f"> task ({desc}): {block.input['prompt'][:80]}")
                     print("------------------------------------------------------------------------------------------------------------------------")
-                    print(f"=== user input (loop#{input_counter})::agent action (loop#{agent_counter}) === user_run_tool \"{block.name}\"(subagent) running: ")
+                    print(f"=== user#{input_counter}::agent#{agent_counter} === {time.strftime('%Y-%m-%d %H:%M:%S')} user_run_tool \"{block.name}\"(subagent) running: ")
                     output = run_subagent(block.input["prompt"])
                 else:
                     handler = TOOL_HANDLERS.get(block.name)
                     output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
-                print(f"  {str(output)[:200]}")
+                #print(f"  {str(output)[:200]}")
                 results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)})
 
         print("------------------------------------------------------------------------------------------------------------------------")
-        print(f"=== user input (loop#{input_counter})::agent action (loop#{agent_counter}) === {time.strftime('%Y-%m-%d %H:%M:%S')} user_run_tool \"{block.name}\" result: ")
+        print(f"=== user#{input_counter}::agent#{agent_counter} === {time.strftime('%Y-%m-%d %H:%M:%S')} user_run_tool \"{block.name}\" result: ")
         results_serialized = serialize_list(results)
         print(json.dumps(results_serialized, indent=2, ensure_ascii=False))
 
@@ -339,27 +359,31 @@ if __name__ == "__main__":
             break
         history.append({"role": "user", "content": query})
 
+##add_private_codes_begin############################################################################
         input_counter += 1
         print("------------------------------------------------------------------------------------------------------------------------")
         print("------------------------------------------------------------------------------------------------------------------------")
-        print(f"<<<<<< user input (loop#{input_counter}) >>>>>>")
+        print(f"<<<<<< user input (loop#{input_counter}) {time.strftime('%Y-%m-%d %H:%M:%S')} >>>>>>")
         pprint(f"{query}")
-        print(f"<<<<<< hist input (loop#{input_counter}) >>>>>>")
+        print(f"<<<<<< hist input (loop#{input_counter}) {time.strftime('%Y-%m-%d %H:%M:%S')} >>>>>>")
         history_serialized = serialize_list(history)
         print(json.dumps(history_serialized, indent=2, ensure_ascii=False))
         agent_counter = 0
+##add_private_codes_end############################################################################
 
         agent_loop(history)
 
-        input_counter += 1
+##add_private_codes_begin############################################################################
         print("------------------------------------------------------------------------------------------------------------------------")
-        print("------------------------------------------------------------------------------------------------------------------------")
-        print(f"<<<<<< user input (loop#{input_counter}) >>>>>>")
-        pprint(f"{query}")
-        print(f"<<<<<< hist input (loop#{input_counter}) >>>>>>")
+        print(f"<<<<<< hist output (loop#{input_counter}) {time.strftime('%Y-%m-%d %H:%M:%S')} >>>>>>")
         history_serialized = serialize_list(history)
         print(json.dumps(history_serialized, indent=2, ensure_ascii=False))
-        agent_counter = 0
+        print("------------------------------------------------------------------------------------------------------------------------")
+        print_token_stats()
+        print("------------------------------------------------------------------------------------------------------------------------")
+        print("------------------------------------------------------------------------------------------------------------------------")
+##add_private_codes_end############################################################################
+
         #response_content = history[-1]["content"]
         #if isinstance(response_content, list):
         #    for block in response_content:
