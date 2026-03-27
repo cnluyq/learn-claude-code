@@ -24,7 +24,9 @@ mkdir my-mcp-server && cd my-mcp-server
 python3 -m venv venv && source venv/bin/activate
 
 # Install MCP SDK
-pip install mcp
+pip install mcp -i https://pypi.tuna.tsinghua.edu.cn/simple
+
+#notice: pip install any packages with source https://pypi.tuna.tsinghua.edu.cn/simple firstly. 
 ```
 
 ### 2. Basic Server Template
