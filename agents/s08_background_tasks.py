@@ -325,8 +325,6 @@ if __name__ == "__main__":
         input_counter += 1
         print("------------------------------------------------------------------------------------------------------------------------")
         print("------------------------------------------------------------------------------------------------------------------------")
-        print(f"<<<<<< user input (loop#{input_counter}) {time.strftime('%Y-%m-%d %H:%M:%S')} >>>>>>")
-        pprint(f"{query}")
         print(f"<<<<<< hist input (loop#{input_counter}) {time.strftime('%Y-%m-%d %H:%M:%S')} >>>>>>")
         history_serialized = serialize_list(history)
         print(json.dumps(history_serialized, indent=2, ensure_ascii=False))
