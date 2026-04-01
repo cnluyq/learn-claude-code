@@ -62,6 +62,83 @@ IDLE_TIMEOUT = 60
 
 SYSTEM = f"You are a team lead at {WORKDIR}. Teammates are autonomous -- they find work themselves."
 
+##add_private_codes_begin############################################################################
+from pprint import pprint
+import json
+import time
+# 统计用户输入loop次数
+input_counter = 0
+# 统计针对每次用户输入agent和LLM交互次数
+agent_counter = 0
+
+# 全局统计字典
+token_stats = {}
+
+def update_token_stats(response):
+    """更新 token 使用统计"""
+    model = response.model
+    usage = response.usage
+
+    # 确保该模型已有统计条目
+    if model not in token_stats:
+        token_stats[model] = {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+        }
+
+    # 累加各个字段，注意 None 值转为 0
+    token_stats[model]["input_tokens"] += usage.input_tokens or 0
+    token_stats[model]["output_tokens"] += usage.output_tokens or 0
+    token_stats[model]["cache_creation_input_tokens"] += usage.cache_creation_input_tokens or 0
+    token_stats[model]["cache_read_input_tokens"] += usage.cache_read_input_tokens or 0
+
+def print_token_stats():
+    print("=== Token Usage Statistics (total from session start) ===")
+    for model, stats in token_stats.items():
+        print(f"Model: {model}")
+        print(f"  Input tokens: {stats['input_tokens']}")
+        print(f"  Output tokens: {stats['output_tokens']}")
+        print(f"  Cache creation input tokens: {stats['cache_creation_input_tokens']}")
+        print(f"  Cache read input tokens: {stats['cache_read_input_tokens']}")
+
+def serialize_list(list_data):
+    serialized = []
+    for item in list_data:
+        item_copy = item.copy()
+        content = item_copy.get("content")
+        if isinstance(content, list):
+            new_content = []
+            for block in content:
+                # 将 block 转换为 dict
+                if hasattr(block, "model_dump"):
+                    block_dict = block.model_dump()
+                elif hasattr(block, "to_dict"):
+                    block_dict = block.to_dict()
+                else:
+                    block_dict = block
+                # 处理 tool_result 的 content
+                if isinstance(block_dict, dict) and block_dict.get("type") == "tool_result":
+                    block_content = block_dict.get("content")
+                    if isinstance(block_content, str):
+                        try:
+                            block_dict["content"] = json.loads(block_content)
+                        except json.JSONDecodeError:
+                            pass
+                new_content.append(block_dict)
+            item_copy["content"] = new_content
+        elif isinstance(content, str):
+            # 如果是字符串，尝试解析为 JSON（适用于顶层 tool_result）
+            try:
+                parsed = json.loads(content)
+                item_copy["content"] = parsed
+            except json.JSONDecodeError:
+                pass  # 保持原样
+        serialized.append(item_copy)
+    return serialized
+##add_private_codes_end############################################################################
+
 VALID_MSG_TYPES = {
     "message",
     "broadcast",
@@ -224,6 +301,8 @@ class TeammateManager:
                         return
                     messages.append({"role": "user", "content": json.dumps(msg)})
                 try:
+                    print("------------------------------------------------------------------------------------------------------------------------")
+                    print(f"=== [teammate {name}] === {time.strftime('%Y-%m-%d %H:%M:%S')} round#{round_num} calling LLM ......")
                     response = client.messages.create(
                         model=MODEL,
                         system=sys_prompt,
@@ -234,6 +313,15 @@ class TeammateManager:
                 except Exception:
                     self._set_status(name, "idle")
                     return
+
+                update_token_stats(response)
+
+                print(f"=== [teammate {name}] === {time.strftime('%Y-%m-%d %H:%M:%S')} round#{round_num} LLM response: ")
+                if hasattr(response, "model_dump"):
+                    print(json.dumps(response.model_dump(), indent=2, ensure_ascii=False))
+                else:
+                    pprint(response, indent=2, width=120)
+
                 messages.append({"role": "assistant", "content": response.content})
                 if response.stop_reason != "tool_use":
                     break
@@ -246,12 +334,18 @@ class TeammateManager:
                             output = "Entering idle phase. Will poll for new tasks."
                         else:
                             output = self._exec(name, block.name, block.input)
-                        print(f"  [{name}] {block.name}: {str(output)[:120]}")
+                        #print(f"  [{name}] {block.name}: {str(output)[:120]}")
                         results.append({
                             "type": "tool_result",
                             "tool_use_id": block.id,
                             "content": str(output),
                         })
+
+                print("------------------------------------------------------------------------------------------------------------------------")
+                print(f"=== [teammate {name}] === {time.strftime('%Y-%m-%d %H:%M:%S')} round#{round_num} \"{block.name}\" result: ")
+                results_serialized = serialize_list(results)
+                print(json.dumps(results_serialized, indent=2, ensure_ascii=False))
+
                 messages.append({"role": "user", "content": results})
                 if idle_requested:
                     break
@@ -508,7 +602,12 @@ TOOLS = [
 
 
 def agent_loop(messages: list):
+    global agent_counter
     while True:
+        agent_counter += 1
+        print("------------------------------------------------------------------------------------------------------------------------")
+        print(f"=== [teammate lead] === {time.strftime('%Y-%m-%d %H:%M:%S')} user_input#{input_counter} round#{agent_counter} calling LLM ......")
+
         inbox = BUS.read_inbox("lead")
         if inbox:
             messages.append({
@@ -526,6 +625,15 @@ def agent_loop(messages: list):
             tools=TOOLS,
             max_tokens=8000,
         )
+
+        update_token_stats(response)
+
+        print(f"=== [teammate lead] === {time.strftime('%Y-%m-%d %H:%M:%S')} user_input#{input_counter} round#{agent_counter} LLM response: ")
+        if hasattr(response, "model_dump"):
+            print(json.dumps(response.model_dump(), indent=2, ensure_ascii=False))
+        else:
+            pprint(response, indent=2, width=120)
+
         messages.append({"role": "assistant", "content": response.content})
         if response.stop_reason != "tool_use":
             return
@@ -543,6 +651,12 @@ def agent_loop(messages: list):
                     "tool_use_id": block.id,
                     "content": str(output),
                 })
+
+        print("------------------------------------------------------------------------------------------------------------------------")
+        print(f"=== [teammate lead] === {time.strftime('%Y-%m-%d %H:%M:%S')} user_input#{input_counter} round#{agent_counter} user_run_tool \"{block.name}\" result: ")
+        results_serialized = serialize_list(results)
+        print(json.dumps(results_serialized, indent=2, ensure_ascii=False))
+
         messages.append({"role": "user", "content": results})
 
 
@@ -561,6 +675,9 @@ if __name__ == "__main__":
         if query.strip() == "/inbox":
             print(json.dumps(BUS.read_inbox("lead"), indent=2))
             continue
+        if query.strip() == "/tokens":
+            print_token_stats()
+            continue
         if query.strip() == "/tasks":
             TASKS_DIR.mkdir(exist_ok=True)
             for f in sorted(TASKS_DIR.glob("task_*.json")):
@@ -570,7 +687,28 @@ if __name__ == "__main__":
                 print(f"  {marker} #{t['id']}: {t['subject']}{owner}")
             continue
         history.append({"role": "user", "content": query})
+##add_private_codes_begin############################################################################
+        input_counter += 1
+        print("------------------------------------------------------------------------------------------------------------------------")
+        print("------------------------------------------------------------------------------------------------------------------------")
+        print(f"<<<<<< [teammate lead] history input (round#{input_counter}) {time.strftime('%Y-%m-%d %H:%M:%S')} >>>>>>")
+        history_serialized = serialize_list(history)
+        print(json.dumps(history_serialized, indent=2, ensure_ascii=False))
+        agent_counter = 0
+##add_private_codes_end############################################################################
+
         agent_loop(history)
+
+##add_private_codes_begin############################################################################
+        print("------------------------------------------------------------------------------------------------------------------------")
+        print(f"<<<<<< [teammate lead] history output (round#{input_counter}) {time.strftime('%Y-%m-%d %H:%M:%S')} >>>>>>")
+        history_serialized = serialize_list(history)
+        print(json.dumps(history_serialized, indent=2, ensure_ascii=False))
+        print("------------------------------------------------------------------------------------------------------------------------")
+        print_token_stats()
+        print("------------------------------------------------------------------------------------------------------------------------")
+        print("------------------------------------------------------------------------------------------------------------------------")
+##add_private_codes_end############################################################################
         response_content = history[-1]["content"]
         if isinstance(response_content, list):
             for block in response_content:
