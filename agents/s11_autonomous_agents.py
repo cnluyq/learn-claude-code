@@ -63,9 +63,64 @@ IDLE_TIMEOUT = 60
 SYSTEM = f"You are a team lead at {WORKDIR}. Teammates are autonomous -- they find work themselves."
 
 ##add_private_codes_begin############################################################################
+import threading
+import sys
+
+# 线程局部存储：每个线程拥有自己的输出文件对象（None 表示使用原始 stdout）
+_thread_output = threading.local()
+
+def tprint(*args, **kwargs):
+    """
+    自定义 print 函数，根据当前线程的输出目标决定输出位置。
+    用法与内置 print 完全相同。
+    """
+    # 获取当前线程的输出目标
+    out = getattr(_thread_output, 'target', None)
+    #print(f"out is {out}", file=sys.__stderr__)
+    if out is None:
+        # 没有设置目标，使用内置 print 输出到原始 stdout
+        return print(*args, **kwargs)
+    # 否则写入到指定的文件对象（如 PTY）
+    # 注意：需要处理 kwargs 中的 'file', 'flush' 等，但为了简单，我们忽略 file 参数（强制写入 out）
+    # 将 args 转换为字符串，支持 sep 和 end
+    sep = kwargs.get('sep', ' ')
+    end = kwargs.get('end', '\n')
+    file = out
+    flush = kwargs.get('flush', False)
+    # 拼接字符串
+    line = sep.join(str(arg) for arg in args) + end
+    file.write(line)
+    file.flush()   # 确保立即输出
+    if flush:
+        file.flush()
+
+
+
+def create_tmux_pane() -> str:
+    """创建一个新的 tmux 窗格（后台运行 sleep infinity），返回其 PTY 设备路径"""
+    result = subprocess.run(
+        ["tmux", "split-window", "-h", "-P", "-F", "#{pane_tty}", "sleep", "infinity"],
+        capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"tmux split-window failed: {result.stderr}")
+    tty_path = result.stdout.strip()
+    time.sleep(0.1)  # 等待窗格初始化
+    return tty_path
+
+def close_tmux_pane_by_tty(tty_path: str):
+    """通过 PTY 路径关闭对应的 tmux 窗格（可选）"""
+    # 获取 pane_id
+    result = subprocess.run(
+        ["tmux", "display", "-t", tty_path, "-p", "#{pane_id}"],
+        capture_output=True, text=True
+    )
+    if result.returncode == 0:
+        pane_id = result.stdout.strip()
+        subprocess.run(["tmux", "kill-pane", "-t", pane_id])
+
+
 from pprint import pprint
-import json
-import time
 # 统计用户输入loop次数
 input_counter = 0
 # 统计针对每次用户输入agent和LLM交互次数
@@ -95,13 +150,13 @@ def update_token_stats(response):
     token_stats[model]["cache_read_input_tokens"] += usage.cache_read_input_tokens or 0
 
 def print_token_stats():
-    print("=== Token Usage Statistics (total from session start) ===")
+    tprint("=== Token Usage Statistics (total from session start) ===")
     for model, stats in token_stats.items():
-        print(f"Model: {model}")
-        print(f"  Input tokens: {stats['input_tokens']}")
-        print(f"  Output tokens: {stats['output_tokens']}")
-        print(f"  Cache creation input tokens: {stats['cache_creation_input_tokens']}")
-        print(f"  Cache read input tokens: {stats['cache_read_input_tokens']}")
+        tprint(f"Model: {model}")
+        tprint(f"  Input tokens: {stats['input_tokens']}")
+        tprint(f"  Output tokens: {stats['output_tokens']}")
+        tprint(f"  Cache creation input tokens: {stats['cache_creation_input_tokens']}")
+        tprint(f"  Cache read input tokens: {stats['cache_read_input_tokens']}")
 
 def serialize_list(list_data):
     serialized = []
@@ -273,144 +328,182 @@ class TeammateManager:
 
     def spawn(self, name: str, role: str, prompt: str) -> str:
         member = self._find_member(name)
-        if member:
-            if member["status"] not in ("idle", "shutdown"):
-                return f"Error: '{name}' is currently {member['status']}"
-            member["status"] = "working"
-            member["role"] = role
+        if member and member["status"] not in ("idle", "shutdown"):
+            return f"Error: '{name}' is currently {member['status']}"
+
+        # 尝试创建 tmux 窗格（仅在父进程运行在 tmux 会话中时）
+        tty_path = None
+        pty_file = None
+        if os.environ.get("TMUX"):
+            try:
+                tty_path = create_tmux_pane()
+                # 以行缓冲方式打开 PTY 文件
+                pty_file = open(tty_path, 'w', buffering=1)
+            except Exception as e:
+                tprint(f"Warning: cannot create tmux pane for {name}: {e}, using shared output")
+                tty_path = None
+                pty_file = None
         else:
-            member = {"name": name, "role": role, "status": "working"}
+            print("os.environ.get TUMUX False")
+
+        if pty_file:
+            pty_file.write(f"Teammate {name} pane initialized.\n")
+            pty_file.flush()
+
+        # 更新或创建成员记录
+        if member:
+            member["status"] = "working"
+            member["tty_path"] = tty_path
+        else:
+            member = {
+                "name": name, "role": role, "status": "working","tty_path": tty_path
+            }
             self.config["members"].append(member)
         self._save_config()
         thread = threading.Thread(
             target=self._loop,
-            args=(name, role, prompt),
+            args=(name, role, prompt, pty_file),
             daemon=True,
         )
         self.threads[name] = thread
         thread.start()
-        return f"Spawned '{name}' (role: {role})"
+        return f"Spawned '{name}' (role: {role})" + (f" in pane {tty_path}" if tty_path else "")
 
-    def _loop(self, name: str, role: str, prompt: str):
-        team_name = self.config["team_name"]
-        sys_prompt = (
-            f"You are '{name}', role: {role}, team: {team_name}, at {WORKDIR}. "
-            f"Use idle tool when you have no more work."
-        )
-        messages = [{"role": "user", "content": prompt}]
-        tools = self._teammate_tools()
-        while True:
-            # -- WORK PHASE: standard agent loop --
-            round_num = 0
-            for _ in range(50):
-                round_num += 1
-                inbox = BUS.read_inbox(name)
-                for msg in inbox:
-                    if msg.get("type") == "shutdown_request":
-                        self._set_status(name, "shutdown")
-                        return
-                    messages.append({"role": "user", "content": json.dumps(msg)})
-                try:
-                    print("------------------------------------------------------------------------------------------------------------------------")
-                    print(f"=== [teammate {name}] === {time.strftime('%Y-%m-%d %H:%M:%S')} round#{round_num} calling LLM ......")
-                    response = client.messages.create(
-                        model=MODEL,
-                        system=sys_prompt,
-                        messages=messages,
-                        tools=tools,
-                        max_tokens=8000,
-                    )
-                except Exception as e:
-                    if e.status_code == 500:
-                        print(f"LLM internel error, sleep and retry")
-                        time.sleep(30)
-                        continue
-                    elif e.status_code == 429:
-                        print(f"RateLimitError, sleep and retry")
-                        time.sleep(30)
-                        continue
-                    else:
-                        print(f"exception happended: {e}")
-                        self._set_status(name, "idle")
-                        return
-
-                update_token_stats(response)
-
-                print(f"=== [teammate {name}] === {time.strftime('%Y-%m-%d %H:%M:%S')} round#{round_num} LLM response: ")
-                if hasattr(response, "model_dump"):
-                    print(json.dumps(response.model_dump(), indent=2, ensure_ascii=False))
-                else:
-                    pprint(response, indent=2, width=120)
-
-                messages.append({"role": "assistant", "content": response.content})
-                if response.stop_reason != "tool_use":
-                    break
-                results = []
-                idle_requested = False
-                for block in response.content:
-                    if block.type == "tool_use":
-                        if block.name == "idle":
-                            idle_requested = True
-                            output = "Entering idle phase. Will poll for new tasks."
-                        else:
-                            output = self._exec(name, block.name, block.input)
-                        #print(f"  [{name}] {block.name}: {str(output)[:120]}")
-                        results.append({
-                            "type": "tool_result",
-                            "tool_use_id": block.id,
-                            "content": str(output),
-                        })
-
-                print("------------------------------------------------------------------------------------------------------------------------")
-                print(f"=== [teammate {name}] === {time.strftime('%Y-%m-%d %H:%M:%S')} round#{round_num} \"{block.name}\" result: ")
-                results_serialized = serialize_list(results)
-                print(json.dumps(results_serialized, indent=2, ensure_ascii=False))
-
-                messages.append({"role": "user", "content": results})
-                if idle_requested:
-                    break
-
-            # -- IDLE PHASE: poll for inbox messages and unclaimed tasks --
-            self._set_status(name, "idle")
-            resume = False
-            polls = IDLE_TIMEOUT // max(POLL_INTERVAL, 1)
-            for _ in range(polls):
-                time.sleep(POLL_INTERVAL)
-                inbox = BUS.read_inbox(name)
-                if inbox:
+    def _loop(self, name: str, role: str, prompt: str, pty_file=None):
+        """ teammate 的主循环，增加了输出重定向设置 """
+        # 设置当前线程的输出目标为 pty_file（如果提供）
+        if pty_file is not None:
+            _thread_output.target = pty_file
+        else:
+            _thread_output.target = None   # 确保使用原始 stdout
+        tprint(f"Teammate {name} thread started, pty_file={pty_file}")
+        try:
+            team_name = self.config["team_name"]
+            sys_prompt = (
+                f"You are '{name}', role: {role}, team: {team_name}, at {WORKDIR}. "
+                f"Use idle tool when you have no more work."
+            )
+            messages = [{"role": "user", "content": prompt}]
+            tools = self._teammate_tools()
+            while True:
+                # -- WORK PHASE: standard agent loop --
+                round_num = 0
+                for _ in range(50):
+                    round_num += 1
+                    inbox = BUS.read_inbox(name)
                     for msg in inbox:
                         if msg.get("type") == "shutdown_request":
                             self._set_status(name, "shutdown")
                             return
                         messages.append({"role": "user", "content": json.dumps(msg)})
-                    resume = True
-                    break
-                unclaimed = scan_unclaimed_tasks()
-                if unclaimed:
-                    task = unclaimed[0]
-                    result = claim_task(task["id"], name)
-                    if result.startswith("Error:"):
-                        continue
-                    task_prompt = (
-                        f"<auto-claimed>Task #{task['id']}: {task['subject']}\n"
-                        f"{task.get('description', '')}</auto-claimed>"
-                        f"When the task complete, send message to 'lead' with task-id and status to notify lead to update task status. Then you self to use idle tool to back to user </auto-claimed>"
-                    )
-                    print("------------------------------------------------------------------------------------------------------------------------")
-                    print(f"=== [teammate {name}] === {time.strftime('%Y-%m-%d %H:%M:%S')} claimed task: {task_prompt} ")
+                    try:
+                        tprint("------------------------------------------------------------------------------------------------------------------------")
+                        tprint(f"=== [teammate {name}] === {time.strftime('%Y-%m-%d %H:%M:%S')} round#{round_num} calling LLM ......")
+                        response = client.messages.create(
+                            model=MODEL,
+                            system=sys_prompt,
+                            messages=messages,
+                            tools=tools,
+                            max_tokens=8000,
+                        )
+                    except Exception as e:
+                        if e.status_code == 500:
+                            tprint(f"LLM internel error, sleep and retry")
+                            time.sleep(30)
+                            continue
+                        elif e.status_code == 429:
+                            tprint(f"RateLimitError, sleep and retry")
+                            time.sleep(30)
+                            continue
+                        else:
+                            tprint(f"exception happended: {e}")
+                            self._set_status(name, "idle")
+                            return
 
-                    if len(messages) <= 3:
-                        messages.insert(0, make_identity_block(name, role, team_name))
-                        messages.insert(1, {"role": "assistant", "content": f"I am {name}. Continuing."})
-                    messages.append({"role": "user", "content": task_prompt})
-                    messages.append({"role": "assistant", "content": f"Claimed task #{task['id']}. Working on it."})
-                    resume = True
-                    break
+                    update_token_stats(response)
 
-            if not resume:
-                self._set_status(name, "shutdown")
-                return
-            self._set_status(name, "working")
+                    tprint(f"=== [teammate {name}] === {time.strftime('%Y-%m-%d %H:%M:%S')} round#{round_num} LLM response: ")
+                    if hasattr(response, "model_dump"):
+                        tprint(json.dumps(response.model_dump(), indent=2, ensure_ascii=False))
+                    else:
+                        tprint(pprint.pformat(response, indent=2, width=120))
+
+                    messages.append({"role": "assistant", "content": response.content})
+                    if response.stop_reason != "tool_use":
+                        break
+                    results = []
+                    idle_requested = False
+                    for block in response.content:
+                        if block.type == "tool_use":
+                            if block.name == "idle":
+                                idle_requested = True
+                                output = "Entering idle phase. Will poll for new tasks."
+                            else:
+                                output = self._exec(name, block.name, block.input)
+                            #print(f"  [{name}] {block.name}: {str(output)[:120]}")
+                            results.append({
+                                "type": "tool_result",
+                                "tool_use_id": block.id,
+                                "content": str(output),
+                            })
+
+                            tprint("------------------------------------------------------------------------------------------------------------------------")
+                            tprint(f"=== [teammate {name}] === {time.strftime('%Y-%m-%d %H:%M:%S')} round#{round_num} \"{block.name}\" result: ")
+                            results_serialized = serialize_list(results)
+                            tprint(json.dumps(results_serialized, indent=2, ensure_ascii=False))
+
+                    messages.append({"role": "user", "content": results})
+                    if idle_requested:
+                        break
+
+                # -- IDLE PHASE: poll for inbox messages and unclaimed tasks --
+                self._set_status(name, "idle")
+                resume = False
+                polls = IDLE_TIMEOUT // max(POLL_INTERVAL, 1)
+                for _ in range(polls):
+                    time.sleep(POLL_INTERVAL)
+                    inbox = BUS.read_inbox(name)
+                    if inbox:
+                        for msg in inbox:
+                            if msg.get("type") == "shutdown_request":
+                                self._set_status(name, "shutdown")
+                                return
+                            messages.append({"role": "user", "content": json.dumps(msg)})
+                        resume = True
+                        break
+                    unclaimed = scan_unclaimed_tasks()
+                    if unclaimed:
+                        task = unclaimed[0]
+                        result = claim_task(task["id"], name)
+                        if result.startswith("Error:"):
+                            continue
+                        task_prompt = (
+                            f"<auto-claimed>Task #{task['id']}: {task['subject']}\n"
+                            f"{task.get('description', '')}</auto-claimed>"
+                            f"When the task complete, send message to 'lead' with task-id and status to notify lead to update task status. Then you self to use idle tool to back to user </auto-claimed>"
+                        )
+                        tprint("------------------------------------------------------------------------------------------------------------------------")
+                        tprint(f"=== [teammate {name}] === {time.strftime('%Y-%m-%d %H:%M:%S')} claimed task: {task_prompt} ")
+
+                        if len(messages) <= 3:
+                            messages.insert(0, make_identity_block(name, role, team_name))
+                            messages.insert(1, {"role": "assistant", "content": f"I am {name}. Continuing."})
+                        messages.append({"role": "user", "content": task_prompt})
+                        messages.append({"role": "assistant", "content": f"Claimed task #{task['id']}. Working on it."})
+                        resume = True
+                        break
+
+                if not resume:
+                    self._set_status(name, "shutdown")
+                    return
+                self._set_status(name, "working")
+
+        finally:
+            # 清理：恢复线程输出目标，关闭 PTY 文件（但不关闭 tmux 窗格，让用户手动关闭或保留）
+            _thread_output.target = None
+            if pty_file:
+                pty_file.close()
+                #close_tmux_pane_by_tty(pty_file.name)
 
     def _exec(self, sender: str, tool_name: str, args: dict) -> str:
         # these base tools are unchanged from s02
@@ -725,8 +818,8 @@ def agent_loop(messages: list):
     global agent_counter
     while True:
         agent_counter += 1
-        print("------------------------------------------------------------------------------------------------------------------------")
-        print(f"=== [teammate lead] === {time.strftime('%Y-%m-%d %H:%M:%S')} user_input#{input_counter} round#{agent_counter} calling LLM ......")
+        tprint("------------------------------------------------------------------------------------------------------------------------")
+        tprint(f"=== [teammate lead] === {time.strftime('%Y-%m-%d %H:%M:%S')} user_input#{input_counter} round#{agent_counter} calling LLM ......")
 
         inbox = BUS.read_inbox("lead")
         if inbox:
@@ -749,24 +842,24 @@ def agent_loop(messages: list):
             )
         except Exception as e:
             if e.status_code == 500:
-                print(f"LLM internel error, sleep and retry")
+                tprint(f"LLM internel error, sleep and retry")
                 time.sleep(30) 
                 continue
             elif e.status_code == 429:
-                print(f"RateLimitError, sleep and retry")
+                tprint(f"RateLimitError, sleep and retry")
                 time.sleep(30)
                 continue
             else:
-                print(f"exception happended: {e}")
+                tprint(f"exception happended: {e}")
                 return
 
         update_token_stats(response)
 
-        print(f"=== [teammate lead] === {time.strftime('%Y-%m-%d %H:%M:%S')} user_input#{input_counter} round#{agent_counter} LLM response: ")
+        tprint(f"=== [teammate lead] === {time.strftime('%Y-%m-%d %H:%M:%S')} user_input#{input_counter} round#{agent_counter} LLM response: ")
         if hasattr(response, "model_dump"):
-            print(json.dumps(response.model_dump(), indent=2, ensure_ascii=False))
+            tprint(json.dumps(response.model_dump(), indent=2, ensure_ascii=False))
         else:
-            pprint(response, indent=2, width=120)
+            tprint(pprint.pformat(response, indent=2, width=120))
 
         messages.append({"role": "assistant", "content": response.content})
         if response.stop_reason != "tool_use":
@@ -786,10 +879,10 @@ def agent_loop(messages: list):
                     "content": str(output),
                 })
 
-        print("------------------------------------------------------------------------------------------------------------------------")
-        print(f"=== [teammate lead] === {time.strftime('%Y-%m-%d %H:%M:%S')} user_input#{input_counter} round#{agent_counter} user_run_tool \"{block.name}\" result: ")
-        results_serialized = serialize_list(results)
-        print(json.dumps(results_serialized, indent=2, ensure_ascii=False))
+                tprint("------------------------------------------------------------------------------------------------------------------------")
+                tprint(f"=== [teammate lead] === {time.strftime('%Y-%m-%d %H:%M:%S')} user_input#{input_counter} round#{agent_counter} user_run_tool \"{block.name}\" result: ")
+                results_serialized = serialize_list(results)
+                tprint(json.dumps(results_serialized, indent=2, ensure_ascii=False))
 
         messages.append({"role": "user", "content": results})
 
@@ -804,10 +897,10 @@ if __name__ == "__main__":
         if query.strip().lower() in ("q", "exit", ""):
             break
         if query.strip() == "/team":
-            print(TEAM.list_all())
+            tprint(TEAM.list_all())
             continue
         if query.strip() == "/inbox":
-            print(json.dumps(BUS.read_inbox("lead"), indent=2))
+            tprint(json.dumps(BUS.read_inbox("lead"), indent=2))
             continue
         if query.strip() == "/tokens":
             print_token_stats()
@@ -818,34 +911,34 @@ if __name__ == "__main__":
                 t = json.loads(f.read_text())
                 marker = {"pending": "[ ]", "in_progress": "[>]", "completed": "[x]"}.get(t["status"], "[?]")
                 owner = f" @{t['owner']}" if t.get("owner") else ""
-                print(f"  {marker} #{t['id']}: {t['subject']}{owner}")
+                tprint(f"  {marker} #{t['id']}: {t['subject']}{owner}")
             continue
         history.append({"role": "user", "content": query})
 ##add_private_codes_begin############################################################################
         input_counter += 1
-        print("------------------------------------------------------------------------------------------------------------------------")
-        print("------------------------------------------------------------------------------------------------------------------------")
-        print(f"<<<<<< [teammate lead] history input (round#{input_counter}) {time.strftime('%Y-%m-%d %H:%M:%S')} >>>>>>")
+        tprint("------------------------------------------------------------------------------------------------------------------------")
+        tprint("------------------------------------------------------------------------------------------------------------------------")
+        tprint(f"<<<<<< [teammate lead] history input (round#{input_counter}) {time.strftime('%Y-%m-%d %H:%M:%S')} >>>>>>")
         history_serialized = serialize_list(history)
-        print(json.dumps(history_serialized, indent=2, ensure_ascii=False))
+        tprint(json.dumps(history_serialized, indent=2, ensure_ascii=False))
         agent_counter = 0
 ##add_private_codes_end############################################################################
 
         agent_loop(history)
 
 ##add_private_codes_begin############################################################################
-        print("------------------------------------------------------------------------------------------------------------------------")
-        print(f"<<<<<< [teammate lead] history output (round#{input_counter}) {time.strftime('%Y-%m-%d %H:%M:%S')} >>>>>>")
+        tprint("------------------------------------------------------------------------------------------------------------------------")
+        tprint(f"<<<<<< [teammate lead] history output (round#{input_counter}) {time.strftime('%Y-%m-%d %H:%M:%S')} >>>>>>")
         history_serialized = serialize_list(history)
-        print(json.dumps(history_serialized, indent=2, ensure_ascii=False))
-        print("------------------------------------------------------------------------------------------------------------------------")
+        tprint(json.dumps(history_serialized, indent=2, ensure_ascii=False))
+        tprint("------------------------------------------------------------------------------------------------------------------------")
         print_token_stats()
-        print("------------------------------------------------------------------------------------------------------------------------")
-        print("------------------------------------------------------------------------------------------------------------------------")
+        tprint("------------------------------------------------------------------------------------------------------------------------")
+        tprint("------------------------------------------------------------------------------------------------------------------------")
 ##add_private_codes_end############################################################################
         response_content = history[-1]["content"]
         if isinstance(response_content, list):
             for block in response_content:
                 if hasattr(block, "text"):
-                    print(block.text)
-        print()
+                    tprint(block.text)
+        tprint()
