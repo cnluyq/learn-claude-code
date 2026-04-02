@@ -219,9 +219,18 @@ def claim_task(task_id: int, owner: str) -> str:
         if not path.exists():
             return f"Error: Task {task_id} not found"
         task = json.loads(path.read_text())
+        if task.get("owner"):
+            existing_owner = task.get("owner") or "someone else"
+            return f"Error: Task {task_id} has already been claimed by {existing_owner}"
+        if task.get("status") != "pending":
+            status = task.get("status")
+            return f"Error: Task {task_id} cannot be claimed because its status is '{status}'"
+        if task.get("blockedBy"):
+            return f"Error: Task {task_id} is blocked by other task(s) and cannot be claimed yet"
         task["owner"] = owner
         task["status"] = "in_progress"
         path.write_text(json.dumps(task, indent=2))
+
     return f"Claimed task #{task_id} for {owner}"
 
 
@@ -286,14 +295,15 @@ class TeammateManager:
         team_name = self.config["team_name"]
         sys_prompt = (
             f"You are '{name}', role: {role}, team: {team_name}, at {WORKDIR}. "
-            f"Use idle tool when you have no more work. You will auto-claim new tasks."
+            f"Use idle tool when you have no more work."
         )
         messages = [{"role": "user", "content": prompt}]
         tools = self._teammate_tools()
-
         while True:
             # -- WORK PHASE: standard agent loop --
+            round_num = 0
             for _ in range(50):
+                round_num += 1
                 inbox = BUS.read_inbox(name)
                 for msg in inbox:
                     if msg.get("type") == "shutdown_request":
@@ -310,9 +320,19 @@ class TeammateManager:
                         tools=tools,
                         max_tokens=8000,
                     )
-                except Exception:
-                    self._set_status(name, "idle")
-                    return
+                except Exception as e:
+                    if e.status_code == 500:
+                        print(f"LLM internel error, sleep and retry")
+                        time.sleep(30)
+                        continue
+                    elif e.status_code == 429:
+                        print(f"RateLimitError, sleep and retry")
+                        time.sleep(30)
+                        continue
+                    else:
+                        print(f"exception happended: {e}")
+                        self._set_status(name, "idle")
+                        return
 
                 update_token_stats(response)
 
@@ -368,11 +388,17 @@ class TeammateManager:
                 unclaimed = scan_unclaimed_tasks()
                 if unclaimed:
                     task = unclaimed[0]
-                    claim_task(task["id"], name)
+                    result = claim_task(task["id"], name)
+                    if result.startswith("Error:"):
+                        continue
                     task_prompt = (
                         f"<auto-claimed>Task #{task['id']}: {task['subject']}\n"
                         f"{task.get('description', '')}</auto-claimed>"
+                        f"When the task complete, send message to 'lead' with task-id and status to notify lead to update task status. Then you self to use idle tool to back to user </auto-claimed>"
                     )
+                    print("------------------------------------------------------------------------------------------------------------------------")
+                    print(f"=== [teammate {name}] === {time.strftime('%Y-%m-%d %H:%M:%S')} claimed task: {task_prompt} ")
+
                     if len(messages) <= 3:
                         messages.insert(0, make_identity_block(name, role, team_name))
                         messages.insert(1, {"role": "assistant", "content": f"I am {name}. Continuing."})
@@ -690,8 +716,8 @@ TOOLS = [
      "input_schema": {"type": "object", "properties": {"request_id": {"type": "string"}, "approve": {"type": "boolean"}, "feedback": {"type": "string"}}, "required": ["request_id", "approve"]}},
     {"name": "idle", "description": "Enter idle state (for lead -- rarely used).",
      "input_schema": {"type": "object", "properties": {}}},
-    {"name": "claim_task", "description": "Claim a task from the board by ID.",
-     "input_schema": {"type": "object", "properties": {"task_id": {"type": "integer"}}, "required": ["task_id"]}},
+    #{"name": "claim_task", "description": "Claim a task from the board by ID.",
+    # "input_schema": {"type": "object", "properties": {"task_id": {"type": "integer"}}, "required": ["task_id"]}},
 ]
 
 
@@ -712,13 +738,27 @@ def agent_loop(messages: list):
                 "role": "assistant",
                 "content": "Noted inbox messages.",
             })
-        response = client.messages.create(
-            model=MODEL,
-            system=SYSTEM,
-            messages=messages,
-            tools=TOOLS,
-            max_tokens=8000,
-        )
+
+        try:
+            response = client.messages.create(
+                model=MODEL,
+                system=SYSTEM,
+                messages=messages,
+                tools=TOOLS,
+                max_tokens=8000,
+            )
+        except Exception as e:
+            if e.status_code == 500:
+                print(f"LLM internel error, sleep and retry")
+                time.sleep(30) 
+                continue
+            elif e.status_code == 429:
+                print(f"RateLimitError, sleep and retry")
+                time.sleep(30)
+                continue
+            else:
+                print(f"exception happended: {e}")
+                return
 
         update_token_stats(response)
 
@@ -739,7 +779,7 @@ def agent_loop(messages: list):
                     output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
                 except Exception as e:
                     output = f"Error: {e}"
-                print(f"> {block.name}: {str(output)[:200]}")
+                #print(f"> {block.name}: {str(output)[:200]}")
                 results.append({
                     "type": "tool_result",
                     "tool_use_id": block.id,
