@@ -78,6 +78,138 @@ SYSTEM = (
     "Use worktree_events when you need lifecycle visibility."
 )
 
+##add_private_codes_begin############################################################################
+import threading
+import sys
+
+# 线程局部存储：每个线程拥有自己的输出文件对象（None 表示使用原始 stdout）
+_thread_output = threading.local()
+
+def tprint(*args, **kwargs):
+    """
+    自定义 print 函数，根据当前线程的输出目标决定输出位置。
+    用法与内置 print 完全相同。
+    """
+    # 获取当前线程的输出目标
+    out = getattr(_thread_output, 'target', None)
+    #print(f"out is {out}", file=sys.__stderr__)
+    if out is None:
+        # 没有设置目标，使用内置 print 输出到原始 stdout
+        return print(*args, **kwargs)
+    # 否则写入到指定的文件对象（如 PTY）
+    # 注意：需要处理 kwargs 中的 'file', 'flush' 等，但为了简单，我们忽略 file 参数（强制写入 out）
+    # 将 args 转换为字符串，支持 sep 和 end
+    sep = kwargs.get('sep', ' ')
+    end = kwargs.get('end', '\n')
+    file = out
+    flush = kwargs.get('flush', False)
+    # 拼接字符串
+    line = sep.join(str(arg) for arg in args) + end
+    file.write(line)
+    file.flush()   # 确保立即输出
+    if flush:
+        file.flush()
+
+
+
+def create_tmux_pane() -> str:
+    """创建一个新的 tmux 窗格（后台运行 sleep infinity），返回其 PTY 设备路径"""
+    result = subprocess.run(
+        ["tmux", "split-window", "-h", "-P", "-F", "#{pane_tty}", "sleep", "infinity"],
+        capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"tmux split-window failed: {result.stderr}")
+    tty_path = result.stdout.strip()
+    time.sleep(0.1)  # 等待窗格初始化
+    return tty_path
+
+def close_tmux_pane_by_tty(tty_path: str):
+    """通过 PTY 路径关闭对应的 tmux 窗格（可选）"""
+    # 获取 pane_id
+    result = subprocess.run(
+        ["tmux", "display", "-t", tty_path, "-p", "#{pane_id}"],
+        capture_output=True, text=True
+    )
+    if result.returncode == 0:
+        pane_id = result.stdout.strip()
+        subprocess.run(["tmux", "kill-pane", "-t", pane_id])
+
+
+from pprint import pprint
+# 统计用户输入loop次数
+input_counter = 0
+# 统计针对每次用户输入agent和LLM交互次数
+agent_counter = 0
+
+# 全局统计字典
+token_stats = {}
+
+def update_token_stats(response):
+    """更新 token 使用统计"""
+    model = response.model
+    usage = response.usage
+
+    # 确保该模型已有统计条目
+    if model not in token_stats:
+        token_stats[model] = {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+        }
+
+    # 累加各个字段，注意 None 值转为 0
+    token_stats[model]["input_tokens"] += usage.input_tokens or 0
+    token_stats[model]["output_tokens"] += usage.output_tokens or 0
+    token_stats[model]["cache_creation_input_tokens"] += usage.cache_creation_input_tokens or 0
+    token_stats[model]["cache_read_input_tokens"] += usage.cache_read_input_tokens or 0
+
+def print_token_stats():
+    tprint("=== Token Usage Statistics (total from session start) ===")
+    for model, stats in token_stats.items():
+        tprint(f"Model: {model}")
+        tprint(f"  Input tokens: {stats['input_tokens']}")
+        tprint(f"  Output tokens: {stats['output_tokens']}")
+        tprint(f"  Cache creation input tokens: {stats['cache_creation_input_tokens']}")
+        tprint(f"  Cache read input tokens: {stats['cache_read_input_tokens']}")
+
+def serialize_list(list_data):
+    serialized = []
+    for item in list_data:
+        item_copy = item.copy()
+        content = item_copy.get("content")
+        if isinstance(content, list):
+            new_content = []
+            for block in content:
+                # 将 block 转换为 dict
+                if hasattr(block, "model_dump"):
+                    block_dict = block.model_dump()
+                elif hasattr(block, "to_dict"):
+                    block_dict = block.to_dict()
+                else:
+                    block_dict = block
+                # 处理 tool_result 的 content
+                if isinstance(block_dict, dict) and block_dict.get("type") == "tool_result":
+                    block_content = block_dict.get("content")
+                    if isinstance(block_content, str):
+                        try:
+                            block_dict["content"] = json.loads(block_content)
+                        except json.JSONDecodeError:
+                            pass
+                new_content.append(block_dict)
+            item_copy["content"] = new_content
+        elif isinstance(content, str):
+            # 如果是字符串，尝试解析为 JSON（适用于顶层 tool_result）
+            try:
+                parsed = json.loads(content)
+                item_copy["content"] = parsed
+            except json.JSONDecodeError:
+                pass  # 保持原样
+        serialized.append(item_copy)
+    return serialized
+##add_private_codes_end############################################################################
+
 
 # -- EventBus: append-only lifecycle events for observability --
 class EventBus:
@@ -727,14 +859,40 @@ TOOLS = [
 
 
 def agent_loop(messages: list):
+    global agent_counter
     while True:
-        response = client.messages.create(
-            model=MODEL,
-            system=SYSTEM,
-            messages=messages,
-            tools=TOOLS,
-            max_tokens=8000,
-        )
+        agent_counter += 1
+        tprint("------------------------------------------------------------------------------------------------------------------------")
+        tprint(f"=== [teammate lead] === {time.strftime('%Y-%m-%d %H:%M:%S')} user_input#{input_counter} round#{agent_counter} calling LLM ......")
+        try:
+            response = client.messages.create(
+                model=MODEL,
+                system=SYSTEM,
+                messages=messages,
+                tools=TOOLS,
+                max_tokens=8000,
+            )
+        except Exception as e:
+            if e.status_code == 500:
+                tprint(f"LLM internel error, sleep and retry")
+                time.sleep(30) 
+                continue
+            elif e.status_code == 429:
+                tprint(f"RateLimitError, sleep and retry")
+                time.sleep(30)
+                continue
+            else:
+                tprint(f"exception happended: {e}")
+                return        
+
+        update_token_stats(response)
+
+        tprint(f"=== [teammate lead] === {time.strftime('%Y-%m-%d %H:%M:%S')} user_input#{input_counter} round#{agent_counter} LLM response: ")
+        if hasattr(response, "model_dump"):
+            tprint(json.dumps(response.model_dump(), indent=2, ensure_ascii=False))
+        else:
+            tprint(pprint.pformat(response, indent=2, width=120))
+
         messages.append({"role": "assistant", "content": response.content})
         if response.stop_reason != "tool_use":
             return
@@ -747,7 +905,7 @@ def agent_loop(messages: list):
                     output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
                 except Exception as e:
                     output = f"Error: {e}"
-                print(f"> {block.name}: {str(output)[:200]}")
+                #print(f"> {block.name}: {str(output)[:200]}")
                 results.append(
                     {
                         "type": "tool_result",
@@ -755,6 +913,11 @@ def agent_loop(messages: list):
                         "content": str(output),
                     }
                 )
+                tprint("------------------------------------------------------------------------------------------------------------------------")
+                tprint(f"=== [teammate lead] === {time.strftime('%Y-%m-%d %H:%M:%S')} user_input#{input_counter} round#{agent_counter} user_run_tool \"{block.name}\" result: ")
+                results_serialized = serialize_list(results)
+                tprint(json.dumps(results_serialized, indent=2, ensure_ascii=False))
+
         messages.append({"role": "user", "content": results})
 
 
@@ -771,8 +934,34 @@ if __name__ == "__main__":
             break
         if query.strip().lower() in ("q", "exit", ""):
             break
+        if query.strip() == "/tokens":
+            print_token_stats()
+            continue
+
         history.append({"role": "user", "content": query})
+##add_private_codes_begin############################################################################
+        input_counter += 1
+        tprint("------------------------------------------------------------------------------------------------------------------------")
+        tprint("------------------------------------------------------------------------------------------------------------------------")
+        tprint(f"<<<<<< [teammate lead] history input (round#{input_counter}) {time.strftime('%Y-%m-%d %H:%M:%S')} >>>>>>")
+        history_serialized = serialize_list(history)
+        tprint(json.dumps(history_serialized, indent=2, ensure_ascii=False))
+        agent_counter = 0
+##add_private_codes_end############################################################################
+
         agent_loop(history)
+
+##add_private_codes_begin############################################################################
+        tprint("------------------------------------------------------------------------------------------------------------------------")
+        tprint(f"<<<<<< [teammate lead] history output (round#{input_counter}) {time.strftime('%Y-%m-%d %H:%M:%S')} >>>>>>")
+        history_serialized = serialize_list(history)
+        tprint(json.dumps(history_serialized, indent=2, ensure_ascii=False))
+        tprint("------------------------------------------------------------------------------------------------------------------------")
+        print_token_stats()
+        tprint("------------------------------------------------------------------------------------------------------------------------")
+        tprint("------------------------------------------------------------------------------------------------------------------------")
+##add_private_codes_end############################################################################
+
         response_content = history[-1]["content"]
         if isinstance(response_content, list):
             for block in response_content:
